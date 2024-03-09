@@ -60,7 +60,7 @@ impl AstModuleFindCallName for AstModule {
                                     node: Expr::Literal(AstLiteral::String(s)),
                                     ..
                                 },
-                            ) if arg_name.node == "name" && s.node == name => Some(identifier.span),
+                            ) if arg_name.node == "name" && s.node == name => Some(node.span),
                             _ => None,
                         });
                         if found.is_some() {
@@ -104,7 +104,10 @@ def x(name = "foo_name"):
         assert_eq!(
             Some(ResolvedSpan {
                 begin: ResolvedPos { line: 1, column: 0 },
-                end: ResolvedPos { line: 1, column: 3 }
+                end: ResolvedPos {
+                    line: 1,
+                    column: 22
+                }
             }),
             module
                 .find_function_call_with_name("foo_name")
