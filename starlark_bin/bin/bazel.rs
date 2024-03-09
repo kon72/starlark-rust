@@ -665,7 +665,7 @@ impl LspContext for BazelContext {
 
         // Try the presumed filename first, and check if it exists.
         let presumed_path = folder.join(label.name);
-        if presumed_path.exists() {
+        if presumed_path.exists() && !presumed_path.is_dir() {
             return Ok(Url::from_file_path(presumed_path).unwrap().try_into()?);
         }
 
