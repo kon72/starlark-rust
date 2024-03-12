@@ -386,6 +386,31 @@ impl BazelContext {
         )
     }
 
+    fn get_repository_mapping(&self, repository: &str) -> Option<HashMap<String, String>> {
+        let mut raw_command = Command::new("bazel");
+        let mut command = raw_command
+            .arg("mod")
+            .arg("dump_repo_mapping")
+            .arg(repository);
+        command = command.current_dir(std::env::current_dir().ok()?);
+
+        let output = command.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let output = String::from_utf8(output.stdout).ok()?;
+        let entry = output.lines().nth(0)?;
+        Some(
+            serde_json::from_str::<serde_json::Value>(entry)
+                .ok()?
+                .as_object()?
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.to_owned(), s.to_owned())))
+                .collect(),
+        )
+    }
+
     fn get_repository_for_path<'a>(&'a self, path: &'a Path) -> Option<(Cow<'a, str>, &'a Path)> {
         self.external_output_base
             .as_ref()
@@ -426,15 +451,10 @@ impl BazelContext {
             // Repository is empty, and we know what file we're resolving from. Use the build
             // system information to check if we're in a known remote repository, and what the
             // root is. Fall back to the `workspace_root` otherwise.
-            (None, LspUrl::File(current_file)) => {
-                if let Some((_, remote_repository_root)) =
-                    self.get_repository_for_path(current_file)
-                {
-                    Some(Cow::Borrowed(remote_repository_root))
-                } else {
-                    workspace_root.map(Cow::Borrowed)
-                }
-            }
+            (None, LspUrl::File(current_file)) => self
+                .get_repository_for_path(current_file)
+                .and_then(|(repository, _)| self.get_repository_path(&repository).map(Cow::Owned))
+                .or(workspace_root.map(Cow::Borrowed)),
             // No repository in the load path, and we don't have build system information, or
             // an `LspUrl` we can't use to check the root. Use the workspace root.
             (None, _) => workspace_root.map(Cow::Borrowed),
@@ -442,17 +462,35 @@ impl BazelContext {
             // name refers to the workspace, and if so, use the workspace root. If not, check
             // if it refers to a known remote repository, and if so, use that root.
             // Otherwise, fail with an error.
-            (Some(repository), _) => {
-                if matches!(self.workspace_name.as_ref(), Some(name) if name == &repository.name) {
+            (Some(repository), current_file) => {
+                let canonical_repo_name: Cow<str> = match repository {
+                    repo if repo.is_canonical => Cow::Borrowed(repo.name.as_str()),
+                    repo => {
+                        let current_repo = match current_file {
+                            LspUrl::File(current_file) => self
+                                .get_repository_for_path(current_file)
+                                .map(|(repository, _)| repository),
+                            _ => None,
+                        }
+                        .unwrap_or(Cow::Borrowed(""));
+                        self.get_repository_mapping(&current_repo)
+                            .and_then(|mut mapping| mapping.remove(&repo.name).map(Cow::Owned))
+                            .unwrap_or(Cow::Borrowed(repo.name.as_str()))
+                    }
+                };
+                if canonical_repo_name.is_empty()
+                    || matches!(self.workspace_name.as_ref(), Some(name) if name == &canonical_repo_name)
+                {
                     workspace_root.map(Cow::Borrowed)
-                } else if let Some(remote_repository_root) =
-                    self.get_repository_path(&repository.name).map(Cow::Owned)
+                } else if let Some(remote_repository_root) = self
+                    .get_repository_path(&canonical_repo_name)
+                    .map(Cow::Owned)
                 {
                     Some(remote_repository_root)
                 } else {
                     return Err(ResolveLoadError::UnknownRepository(
                         label.clone(),
-                        repository.name.clone(),
+                        canonical_repo_name.into_owned(),
                     )
                     .into());
                 }
