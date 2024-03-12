@@ -523,27 +523,32 @@ impl BazelContext {
     }
 
     fn get_repository_names(&self) -> Vec<Cow<str>> {
-        let mut names = Vec::new();
-        if let Some(workspace_name) = &self.workspace_name {
-            names.push(Cow::Borrowed(workspace_name.as_str()));
-        }
+        match self.get_repository_mapping("") {
+            Some(mapping) => mapping.keys().map(|k| Cow::Owned(k.to_owned())).collect(),
+            None => {
+                let mut names = Vec::new();
+                if let Some(workspace_name) = &self.workspace_name {
+                    names.push(Cow::Borrowed(workspace_name.as_str()));
+                }
 
-        if let Some(external_output_base) = self.external_output_base.as_ref() {
-            // Look for existing folders in `external_output_base`.
-            if let Ok(entries) = std::fs::read_dir(external_output_base) {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_dir() {
-                            if let Some(name) = entry.file_name().to_str() {
-                                names.push(Cow::Owned(name.to_owned()));
+                if let Some(external_output_base) = self.external_output_base.as_ref() {
+                    // Look for existing folders in `external_output_base`.
+                    if let Ok(entries) = std::fs::read_dir(external_output_base) {
+                        for entry in entries.flatten() {
+                            if let Ok(file_type) = entry.file_type() {
+                                if file_type.is_dir() {
+                                    if let Some(name) = entry.file_name().to_str() {
+                                        names.push(Cow::Owned(name.to_owned()));
+                                    }
+                                }
                             }
                         }
                     }
                 }
+
+                names
             }
         }
-
-        names
     }
 
     fn get_filesystem_entries(
