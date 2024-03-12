@@ -406,7 +406,15 @@ impl<T: LspContext> Backend<T> {
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             definition_provider,
-            completion_provider: Some(CompletionOptions::default()),
+            completion_provider: Some(CompletionOptions {
+                trigger_characters: Some(vec![
+                    String::from("\""),
+                    String::from("@"),
+                    String::from("/"),
+                    String::from(":"),
+                ]),
+                ..CompletionOptions::default()
+            }),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             ..ServerCapabilities::default()
         }
