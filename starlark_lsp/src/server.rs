@@ -362,9 +362,16 @@ pub trait LspContext {
         document_uri: &LspUrl,
         kind: StringCompletionType,
         current_value: &str,
+        cursor_offset: usize,
         workspace_root: Option<&Path>,
     ) -> anyhow::Result<Vec<StringCompletionResult>> {
-        let _unused = (document_uri, kind, current_value, workspace_root);
+        let _unused = (
+            document_uri,
+            kind,
+            current_value,
+            cursor_offset,
+            workspace_root,
+        );
         Ok(Vec::new())
     }
 }
@@ -745,6 +752,8 @@ impl<T: LspContext> Backend<T> {
                 let workspace_root =
                     Self::get_workspace_root(initialize_params.workspace_folders.as_ref(), &uri);
 
+                eprintln!("{:?}", autocomplete_type);
+
                 match &autocomplete_type {
                     None | Some(AutocompleteType::None) => None,
                     Some(AutocompleteType::Default) => Some(
@@ -760,10 +769,12 @@ impl<T: LspContext> Backend<T> {
                     Some(AutocompleteType::LoadPath {
                         current_value,
                         current_span,
+                        cursor_offset,
                     })
                     | Some(AutocompleteType::String {
                         current_value,
                         current_span,
+                        cursor_offset,
                     }) => Some(self.string_completion_options(
                         &uri,
                         if matches!(&autocomplete_type, Some(AutocompleteType::LoadPath { .. })) {
@@ -773,6 +784,7 @@ impl<T: LspContext> Backend<T> {
                         },
                         current_value,
                         *current_span,
+                        *cursor_offset,
                         workspace_root.as_deref(),
                     )?),
                     Some(AutocompleteType::LoadSymbol {
@@ -812,6 +824,8 @@ impl<T: LspContext> Backend<T> {
             }
             None => None,
         };
+
+        // eprintln!("{:?}", symbols);
 
         Ok(CompletionResponse::Array(symbols.unwrap_or_default()))
     }

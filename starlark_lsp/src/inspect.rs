@@ -20,6 +20,7 @@ use starlark::codemap::Pos;
 use starlark::codemap::ResolvedSpan;
 use starlark::codemap::Span;
 use starlark::syntax::AstModule;
+use starlark_syntax::fast_string;
 use starlark_syntax::syntax::ast::ArgumentP;
 use starlark_syntax::syntax::ast::AssignP;
 use starlark_syntax::syntax::ast::AstArgumentP;
@@ -43,6 +44,7 @@ pub enum AutocompleteType {
     LoadPath {
         current_value: String,
         current_span: ResolvedSpan,
+        cursor_offset: usize,
     },
     /// Offer completions of symbols in a loaded module. Cursor is in a load statement, but
     /// after the module path.
@@ -56,6 +58,7 @@ pub enum AutocompleteType {
     String {
         current_value: String,
         current_span: ResolvedSpan,
+        cursor_offset: usize,
     },
     /// Offer completions of function parameters names. Cursor is in a function call. ALSO offer
     /// regular symbol completions, since this might be e.g. a positional argument, in which cases
@@ -98,11 +101,17 @@ impl AstModuleInspect for AstModule {
             stmt: Visit<AstNoPayload>,
         ) -> Option<AutocompleteType> {
             // Utility function to get the span of a string literal without the quotes.
-            fn string_span_without_quotes(codemap: &CodeMap, span: Span) -> ResolvedSpan {
-                let mut span = codemap.resolve_span(span);
-                span.begin.column += 1;
-                span.end.column -= 1;
-                span
+            fn string_span_without_quotes(span: Span) -> Span {
+                Span::new(span.begin() + 1, span.end() - 1)
+            }
+
+            // Utility function to get the position of the cursor in a string literal.
+            // Returns None if the cursor is outside the span.
+            fn get_cursor_offset(codemap: &CodeMap, span: Span, position: Pos) -> Option<usize> {
+                if !span.contains(position) {
+                    return None;
+                }
+                Some(fast_string::len(codemap.source_span(Span::new(span.begin(), position))).0)
             }
 
             let span = match &stmt {
@@ -146,17 +155,26 @@ impl AstModuleInspect for AstModule {
                     ..
                 }) => {
                     if load.module.span.contains(position) {
-                        return Some(AutocompleteType::LoadPath {
-                            current_value: load.module.to_string(),
-                            current_span: string_span_without_quotes(codemap, load.module.span),
-                        });
+                        let span_without_quotes = string_span_without_quotes(load.module.span);
+                        match get_cursor_offset(codemap, span_without_quotes, position) {
+                            // If the cursor is outside the quotes, don't offer any completions.
+                            None => return Some(AutocompleteType::None),
+                            Some(cursor_offset) => {
+                                return Some(AutocompleteType::LoadPath {
+                                    current_value: load.module.to_string(),
+                                    current_span: codemap.resolve_span(span_without_quotes),
+                                    cursor_offset,
+                                })
+                            }
+                        }
                     }
 
                     for LoadArgP { local, .. } in &load.args {
                         if local.span.contains(position) {
                             return Some(AutocompleteType::LoadSymbol {
                                 path: load.module.to_string(),
-                                current_span: string_span_without_quotes(codemap, local.span),
+                                current_span: codemap
+                                    .resolve_span(string_span_without_quotes(local.span)),
                                 previously_loaded: load
                                     .args
                                     .iter()
@@ -307,10 +325,18 @@ impl AstModuleInspect for AstModule {
                     node: ExprP::Literal(AstLiteral::String(str)),
                     ..
                 }) => {
-                    return Some(AutocompleteType::String {
-                        current_value: str.to_string(),
-                        current_span: string_span_without_quotes(codemap, span),
-                    });
+                    let span_without_quotes = string_span_without_quotes(span);
+                    match get_cursor_offset(codemap, span_without_quotes, position) {
+                        // If the cursor is outside the quotes, don't offer any completions.
+                        None => return Some(AutocompleteType::None),
+                        Some(cursor_offset) => {
+                            return Some(AutocompleteType::String {
+                                current_value: str.to_string(),
+                                current_span: codemap.resolve_span(span_without_quotes),
+                                cursor_offset,
+                            });
+                        }
+                    }
                 }
                 Visit::Stmt(stmt) => {
                     let mut result = None;

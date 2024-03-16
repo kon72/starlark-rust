@@ -20,12 +20,15 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use lsp_types::Command;
 use lsp_types::CompletionItem;
 use lsp_types::CompletionItemKind;
+use lsp_types::CompletionItemLabelDetails;
 use lsp_types::CompletionTextEdit;
 use lsp_types::Documentation;
 use lsp_types::MarkupContent;
 use lsp_types::MarkupKind;
+use lsp_types::Position;
 use lsp_types::Range;
 use lsp_types::TextEdit;
 use starlark::codemap::ResolvedSpan;
@@ -58,17 +61,47 @@ pub enum StringCompletionType {
     String,
 }
 
+/// A textual edit applicable to a string
+#[derive(Debug, PartialEq)]
+pub struct StringCompletionTextEdit {
+    pub begin: usize,
+    pub end: usize,
+    pub text: String,
+}
+
 /// A possible result in auto-complete for a string context.
 #[derive(Debug, PartialEq)]
 pub struct StringCompletionResult {
-    /// The value to complete.
-    pub value: String,
-    /// The text to insert, if different from the value.
-    pub insert_text: Option<String>,
-    /// From where to start the insertion, compared to the start of the string.
-    pub insert_text_offset: usize,
+    /// The label of this completion item.
+    pub label: String,
+    /// An edit which is applied to a string.
+    pub text_edit: StringCompletionTextEdit,
+    /// An optional array of additional text edits that are applied.
+    pub additional_text_edits: Option<Vec<StringCompletionTextEdit>>,
     /// The kind of result, e.g. a file vs a folder.
     pub kind: CompletionItemKind,
+    /// A human-readable string with additional information about this item.
+    pub detail: Option<String>,
+    /// Whether this completion triggers another completion after it is inserted.
+    pub trigger_another_completion: bool,
+}
+
+impl StringCompletionTextEdit {
+    pub fn into_text_edit(self, base_pos: ResolvedPos) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position {
+                    line: base_pos.line as u32,
+                    character: (base_pos.column + self.begin) as u32,
+                },
+                end: Position {
+                    line: base_pos.line as u32,
+                    character: (base_pos.column + self.end) as u32,
+                },
+            },
+            new_text: self.text,
+        }
+    }
 }
 
 impl<T: LspContext> Backend<T> {
@@ -341,26 +374,45 @@ impl<T: LspContext> Backend<T> {
         kind: StringCompletionType,
         current_value: &str,
         current_span: ResolvedSpan,
+        cursor_offset: usize,
         workspace_root: Option<&Path>,
     ) -> anyhow::Result<Vec<CompletionItem>> {
         Ok(self
             .context
-            .get_string_completion_options(document_uri, kind, current_value, workspace_root)?
+            .get_string_completion_options(
+                document_uri,
+                kind,
+                current_value,
+                cursor_offset,
+                workspace_root,
+            )?
             .into_iter()
-            .map(|result| {
-                let mut range: Range = current_span.into();
-                range.start.character += result.insert_text_offset as u32;
-
-                CompletionItem {
-                    label: result.value.clone(),
-                    kind: Some(result.kind),
-                    insert_text: result.insert_text.clone(),
-                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                        range,
-                        new_text: result.insert_text.unwrap_or(result.value),
-                    })),
+            .map(|result| CompletionItem {
+                label: result.label,
+                kind: Some(result.kind),
+                label_details: Some(CompletionItemLabelDetails {
+                    description: result.detail,
                     ..Default::default()
-                }
+                }),
+                text_edit: Some(CompletionTextEdit::Edit(
+                    result.text_edit.into_text_edit(current_span.begin),
+                )),
+                additional_text_edits: result.additional_text_edits.map(|edits| {
+                    edits
+                        .into_iter()
+                        .map(|edit| edit.into_text_edit(current_span.begin))
+                        .collect()
+                }),
+                command: if result.trigger_another_completion {
+                    Some(Command {
+                        title: String::from("Trigger Suggest"),
+                        command: String::from("editor.action.triggerSuggest"),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                },
+                ..Default::default()
             })
             .collect())
     }

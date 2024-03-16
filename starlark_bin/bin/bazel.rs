@@ -28,6 +28,7 @@ mod label;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::iter;
@@ -53,6 +54,7 @@ use starlark::eval::Evaluator;
 use starlark::syntax::AstModule;
 use starlark::syntax::Dialect;
 use starlark_lsp::completion::StringCompletionResult;
+use starlark_lsp::completion::StringCompletionTextEdit;
 use starlark_lsp::completion::StringCompletionType;
 use starlark_lsp::error::eval_message_to_lsp_diagnostic;
 use starlark_lsp::server::LspContext;
@@ -107,15 +109,6 @@ enum RenderLoadError {
     WrongScheme(String, LspUrl, LspUrl),
 }
 
-/// Starting point for resolving filesystem completions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FilesystemCompletionRoot<'a> {
-    /// A resolved path, e.g. from an opened document.
-    Path(&'a Path),
-    /// An unresolved path, e.g. from a string literal in a `load` statement.
-    String(&'a str),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FilesystemFileCompletionOptions {
     All,
@@ -130,8 +123,64 @@ struct FilesystemCompletionOptions {
     directories: bool,
     /// Whether to include files in the results.
     files: FilesystemFileCompletionOptions,
-    /// Whether to include target names from BUILD files.
-    targets: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilesystemCompletionResultKind {
+    Directory,
+    File,
+}
+
+/// A possible result in auto-complete for a filesystem context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilesystemCompletionResult {
+    value: String,
+    kind: FilesystemCompletionResultKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetKind {
+    SourceFile,
+    GeneratedFile,
+    Rule(String),
+    Unknown(String),
+}
+
+/// A possible result in auto-complete for a target context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetCompletionResult {
+    value: String,
+    kind: TargetKind,
+}
+
+impl fmt::Display for TargetKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TargetKind::SourceFile => f.write_str("source file")?,
+            TargetKind::GeneratedFile => f.write_str("generated file")?,
+            TargetKind::Rule(ref name) => {
+                f.write_str(name)?;
+                f.write_str(" rule")?;
+            }
+            TargetKind::Unknown(ref name) => f.write_str(name)?,
+        }
+
+        Ok(())
+    }
+}
+
+impl TargetKind {
+    pub fn parse(kind: &str) -> Self {
+        if kind == "source file" {
+            TargetKind::SourceFile
+        } else if kind == "generated file" {
+            TargetKind::GeneratedFile
+        } else if let Some(rule_name) = kind.strip_suffix(" rule") {
+            TargetKind::Rule(rule_name.to_owned())
+        } else {
+            TargetKind::Unknown(kind.to_owned())
+        }
+    }
 }
 
 pub(crate) fn main(
@@ -553,115 +602,93 @@ impl BazelContext {
 
     fn get_filesystem_entries(
         &self,
-        from: FilesystemCompletionRoot,
-        current_file: &LspUrl,
-        workspace_root: Option<&Path>,
+        from: &Path,
         options: &FilesystemCompletionOptions,
-        results: &mut Vec<StringCompletionResult>,
-    ) -> anyhow::Result<()> {
-        // Find the actual folder on disk we're looking at.
-        let (from_path, render_base) = match from {
-            FilesystemCompletionRoot::Path(path) => (path.to_owned(), path.to_string_lossy()),
-            FilesystemCompletionRoot::String(str) => {
-                let label = Label::parse(str)?;
-                (
-                    self.resolve_folder(&label, current_file, workspace_root)?,
-                    Cow::Borrowed(str),
-                )
-            }
-        };
+    ) -> anyhow::Result<Vec<FilesystemCompletionResult>> {
+        let mut results = Vec::new();
 
-        for entry in fs::read_dir(from_path)? {
+        for entry in fs::read_dir(from)? {
             let entry = entry?;
             let path = entry.path();
             // NOTE: Safe to `unwrap()` here, because we know that `path` is a file system path. And
             // since it's an entry in a directory, it must have a file name.
             let file_name = path.file_name().unwrap().to_string_lossy();
-            if path.is_dir() && options.directories {
-                results.push(StringCompletionResult {
+            if path.is_dir() && !path.is_symlink() && options.directories {
+                results.push(FilesystemCompletionResult {
                     value: file_name.to_string(),
-                    insert_text: Some(format!(
-                        "{}{}",
-                        if render_base.ends_with('/') || render_base.is_empty() {
-                            ""
-                        } else {
-                            "/"
-                        },
-                        file_name
-                    )),
-                    insert_text_offset: render_base.len(),
-                    kind: CompletionItemKind::FOLDER,
+                    kind: FilesystemCompletionResultKind::Directory,
                 });
-            } else if path.is_file() {
-                if Self::BUILD_FILE_NAMES.contains(&file_name.as_ref()) {
-                    if options.targets {
-                        if let Some(targets) = self.query_buildable_targets(
-                            &format!(
-                                "{render_base}{}",
-                                if render_base.ends_with(':') { "" } else { ":" }
-                            ),
-                            workspace_root,
-                        ) {
-                            results.extend(targets.into_iter().map(|target| {
-                                StringCompletionResult {
-                                    value: target.to_owned(),
-                                    insert_text: Some(format!(
-                                        "{}{}",
-                                        if render_base.ends_with(':') { "" } else { ":" },
-                                        target
-                                    )),
-                                    insert_text_offset: render_base.len(),
-                                    kind: CompletionItemKind::PROPERTY,
-                                }
-                            }));
-                        }
-                    }
-                    continue;
-                } else if options.files != FilesystemFileCompletionOptions::None {
-                    // Check if it's in the list of allowed extensions. If we have a list, and it
-                    // doesn't contain the extension, or the file has no extension, skip this file.
-                    if options.files == FilesystemFileCompletionOptions::OnlyLoadable {
-                        let extension = path.extension().map(|ext| ext.to_string_lossy());
-                        match extension {
-                            Some(extension) => {
-                                if !Self::LOADABLE_EXTENSIONS.contains(&extension.as_ref()) {
-                                    continue;
-                                }
-                            }
-                            None => {
+            } else if path.is_file()
+                && !path.is_symlink()
+                && options.files != FilesystemFileCompletionOptions::None
+                && !Self::BUILD_FILE_NAMES.contains(&file_name.as_ref())
+            {
+                // Check if it's in the list of allowed extensions. If we have a list, and it
+                // doesn't contain the extension, or the file has no extension, skip this file.
+                if options.files == FilesystemFileCompletionOptions::OnlyLoadable {
+                    let extension = path.extension().map(|ext| ext.to_string_lossy());
+                    match extension {
+                        Some(extension) => {
+                            if !Self::LOADABLE_EXTENSIONS.contains(&extension.as_ref()) {
                                 continue;
                             }
                         }
+                        None => {
+                            continue;
+                        }
                     }
-
-                    results.push(StringCompletionResult {
-                        value: file_name.to_string(),
-                        insert_text: Some(format!(
-                            "{}{}",
-                            if render_base.ends_with(':') || render_base.is_empty() {
-                                ""
-                            } else {
-                                ":"
-                            },
-                            file_name
-                        )),
-                        insert_text_offset: render_base.len(),
-                        kind: CompletionItemKind::FILE,
-                    });
                 }
+                results.push(FilesystemCompletionResult {
+                    value: file_name.to_string(),
+                    kind: FilesystemCompletionResultKind::File,
+                });
             }
         }
 
-        Ok(())
+        Ok(results)
+    }
+
+    fn get_target_entries(
+        &self,
+        from: &str,
+        current_file: &LspUrl,
+        workspace_root: Option<&Path>,
+    ) -> anyhow::Result<Vec<TargetCompletionResult>> {
+        // Find the actual folder on disk we're looking at.
+        let package_dir =
+            self.resolve_folder(&Label::parse(from)?, current_file, workspace_root)?;
+        let build_file_exists = Self::BUILD_FILE_NAMES
+            .iter()
+            .any(|name| package_dir.join(name).is_file());
+        if !build_file_exists {
+            return Ok(Vec::new());
+        }
+
+        let query_dir = if from.is_empty() {
+            Some(package_dir.as_ref())
+        } else {
+            workspace_root
+        };
+        if let Some(targets) = self.query_buildable_targets(from, query_dir) {
+            Ok(targets
+                .into_iter()
+                .map(|(kind, value)| TargetCompletionResult { value, kind })
+                .collect())
+        } else {
+            return Ok(Vec::new());
+        }
     }
 
     fn query_buildable_targets(
         &self,
         module: &str,
         workspace_dir: Option<&Path>,
-    ) -> Option<Vec<String>> {
+    ) -> Option<Vec<(TargetKind, String)>> {
         let mut raw_command = Command::new("bazel");
-        let mut command = raw_command.arg("query").arg(format!("{module}*"));
+        let mut command = raw_command
+            .arg("query")
+            .arg("--output=label_kind")
+            .arg(format!("{module}:*"));
         if let Some(workspace_dir) = workspace_dir {
             command = command.current_dir(workspace_dir);
         }
@@ -675,7 +702,10 @@ impl BazelContext {
         Some(
             output
                 .lines()
-                .filter_map(|line| line.strip_prefix(module).map(|str| str.to_owned()))
+                .filter_map(|line| {
+                    let (kind, label) = line.rsplit_once(' ')?;
+                    Some((TargetKind::parse(kind), label.split_once(':')?.1.to_owned()))
+                })
                 .collect(),
         )
     }
@@ -844,25 +874,32 @@ impl LspContext for BazelContext {
         document_uri: &LspUrl,
         kind: StringCompletionType,
         current_value: &str,
+        cursor_offset: usize,
         workspace_root: Option<&Path>,
     ) -> anyhow::Result<Vec<StringCompletionResult>> {
-        let offer_repository_names = current_value.is_empty()
-            || current_value == "@"
-            || (current_value.starts_with('@') && !current_value.contains('/'))
-            || (!current_value.contains('/') && !current_value.contains(':'));
+        let before_cursor = &current_value[..cursor_offset];
+        let offer_repository_names = before_cursor.starts_with('@') && !before_cursor.contains('/');
 
         let mut names = if offer_repository_names {
             self.get_repository_names()
                 .into_iter()
                 .map(|name| {
                     let name_with_at = format!("@{}", name);
-                    let insert_text = format!("{}//", &name_with_at);
-
+                    let text_edit = StringCompletionTextEdit {
+                        begin: 0,
+                        end: current_value
+                            .find("//")
+                            .map(|x| x + 2)
+                            .unwrap_or(current_value.len()),
+                        text: format!("{}//", &name_with_at),
+                    };
                     StringCompletionResult {
-                        value: name_with_at,
-                        insert_text: Some(insert_text),
-                        insert_text_offset: 0,
+                        label: name_with_at,
+                        text_edit,
+                        additional_text_edits: None,
                         kind: CompletionItemKind::MODULE,
+                        detail: None,
+                        trigger_another_completion: true,
                     }
                 })
                 .collect()
@@ -870,61 +907,181 @@ impl LspContext for BazelContext {
             vec![]
         };
 
-        // Complete filenames if we're not in the middle of typing a repository name:
-        // "@foo" -> don't complete filenames (still typing repository)
-        // "@foo/" -> don't complete filenames (need two separating slashes)
-        // "@foo//", "@foo//bar -> complete directories (from `@foo//`)
-        // "@foo//bar/baz" -> complete directories (from `@foo//bar`)
-        // "@foo//bar:baz" -> complete filenames (from `@foo//bar`), and target names if `kind` is `String`
-        // "foo" -> complete directories and filenames (ambiguous, might be a relative path or a repository)
-        let complete_directories = (!current_value.starts_with('@')
-            || current_value.contains("//"))
-            && !current_value.contains(':');
-        let complete_filenames =
-            // Still typing repository
-            (!current_value.starts_with('@') || current_value.contains("//")) &&
-            // Explicitly typing directory
-            (!current_value.contains('/') || current_value.contains(':'));
-        let complete_targets = kind == StringCompletionType::String && complete_filenames;
-        if complete_directories || complete_filenames || complete_targets {
-            if let Some(completion_root) = if complete_directories && complete_filenames {
-                // This must mean we don't have a `/` or `:` separator, so we're completing a relative path.
-                // Use the document URI's directory as the base.
-                document_uri
-                    .path()
-                    .parent()
-                    .map(FilesystemCompletionRoot::Path)
+        // "fo" -> target ":foo" (if it's not source file)
+        //      -> directory "foo/" (if `kind` is `String`)
+        //      -> file "foo" (if `kind` is `String`)
+        //      -> file ":foo.bzl" (if `kind` is `LoadPath`)
+        // "foo/ba" -> target ":foo/bar" (if it's not source file)
+        //          -> directory "foo/bar/" (if `kind` is `String`)
+        //          -> file "foo/bar" (if `kind` is `String`)
+        // ":fo" -> target ":foo" (if it's not source file)
+        //       -> file ":foo.bzl" (if `kind` is `LoadPath`)
+        // "@fo" -> repo "@foo//"
+        // "@foo/" -> (None)
+        // "@foo//ba" -> target "@foo//:bar"
+        //            -> directory "@foo//bar/"
+        //            -> file "@foo//:bar.bzl" (if `kind` is `LoadPath`)
+        // "@foo//:ba" -> target "@foo//:bar"
+        //             -> file "@foo//:bar.bzl" (if `kind` is `LoadPath`)
+        // "@foo//bar/ba" -> target "@foo//bar:baz"
+        //                -> directory "@foo//bar/baz/"
+        //                -> file "@foo//bar:baz.bzl" (if `kind` is `LoadPath`)
+        // "@foo//bar:ba" -> target "@foo//bar:baz"
+        //                -> file "@foo//bar:baz.bzl" (if `kind` is `LoadPath`)
+        let cursor_in_repo = before_cursor.starts_with('@') && !before_cursor.contains("//");
+        let source_file_like = !before_cursor.starts_with('@')
+            && !before_cursor.starts_with('/')
+            && !before_cursor.starts_with(':');
+        let complete_directories = !cursor_in_repo
+            && !before_cursor.contains(':')
+            && !(kind == StringCompletionType::LoadPath && source_file_like);
+        let complete_filenames = !cursor_in_repo
+            && (kind == StringCompletionType::LoadPath || source_file_like)
+            && !(kind == StringCompletionType::LoadPath
+                && source_file_like
+                && before_cursor.contains('/'));
+        let complete_targets = !cursor_in_repo && kind == StringCompletionType::String;
+
+        let root_package = if source_file_like {
+            ""
+        } else {
+            before_cursor
+                .rsplit_once(':')
+                .map(|(package, _)| package)
+                .or_else(|| {
+                    let pos = before_cursor.rfind('/')?;
+                    let package = &before_cursor[..pos + 1];
+                    if package.ends_with("//") {
+                        Some(package)
+                    } else {
+                        Some(&before_cursor[..pos])
+                    }
+                })
+                .unwrap_or("")
+        };
+        if complete_directories || complete_filenames {
+            let render_base = if source_file_like {
+                before_cursor
+                    .rsplit_once('/')
+                    .map(|(dir, _)| dir)
+                    .unwrap_or("")
             } else {
-                // Complete from the last `:` or `/` in the current value.
-                current_value
-                    // NOTE: Can't use `rsplit_once` as we need the value _including_ the value
-                    // we're splitting on.
-                    .rfind(if complete_directories { '/' } else { ':' })
-                    .map(|pos| &current_value[..pos + 1])
-                    .map(FilesystemCompletionRoot::String)
-            } {
-                self.get_filesystem_entries(
-                    completion_root,
-                    document_uri,
-                    workspace_root,
+                root_package
+            };
+            let root_path = if source_file_like {
+                document_uri.path().parent().unwrap().join(render_base)
+            } else {
+                self.resolve_folder(&Label::parse(root_package)?, document_uri, workspace_root)?
+            };
+            let filesystem_entries = self
+                .get_filesystem_entries(
+                    &root_path,
                     &FilesystemCompletionOptions {
                         directories: complete_directories,
-                        files: match (kind, complete_filenames) {
-                            (StringCompletionType::LoadPath, _) => {
+                        files: match (&kind, complete_filenames) {
+                            (StringCompletionType::LoadPath, true) => {
                                 FilesystemFileCompletionOptions::OnlyLoadable
                             }
                             (StringCompletionType::String, true) => {
                                 FilesystemFileCompletionOptions::All
                             }
-                            (StringCompletionType::String, false) => {
-                                FilesystemFileCompletionOptions::None
-                            }
+                            (_, false) => FilesystemFileCompletionOptions::None,
                         },
-                        targets: complete_targets,
                     },
-                    &mut names,
-                )?;
-            }
+                )
+                .unwrap_or_default();
+            names.extend(filesystem_entries.into_iter().map(|entry| {
+                let with_colon_or_slash = before_cursor[render_base.len()..].starts_with(':')
+                    || before_cursor[render_base.len()..].starts_with('/');
+                let drop_colon_or_slash = kind == StringCompletionType::LoadPath
+                    && entry.kind == FilesystemCompletionResultKind::File
+                    && with_colon_or_slash;
+                let text = match (&entry.kind, &kind) {
+                    (FilesystemCompletionResultKind::Directory, _) => format!("{}/", entry.value),
+                    (_, StringCompletionType::String) => format!("{}", entry.value),
+                    (_, StringCompletionType::LoadPath) => format!(":{}", entry.value),
+                };
+                let text_edit = StringCompletionTextEdit {
+                    begin: render_base.chars().count() + if with_colon_or_slash { 1 } else { 0 },
+                    end: match &entry.kind {
+                        FilesystemCompletionResultKind::Directory => current_value[cursor_offset..]
+                            .find("/")
+                            .map(|x| before_cursor.chars().count() + x + 1)
+                            .unwrap_or(current_value.chars().count()),
+                        FilesystemCompletionResultKind::File => current_value.chars().count(),
+                    },
+                    text,
+                };
+                let additional_text_edits = if drop_colon_or_slash {
+                    Some(vec![StringCompletionTextEdit {
+                        begin: render_base.chars().count(),
+                        end: render_base.chars().count() + 1,
+                        text: String::from(""),
+                    }])
+                } else {
+                    None
+                };
+                StringCompletionResult {
+                    label: entry.value,
+                    text_edit,
+                    additional_text_edits,
+                    kind: match &entry.kind {
+                        FilesystemCompletionResultKind::Directory => CompletionItemKind::FOLDER,
+                        FilesystemCompletionResultKind::File => CompletionItemKind::FILE,
+                    },
+                    detail: None,
+                    trigger_another_completion: match &entry.kind {
+                        FilesystemCompletionResultKind::Directory => true,
+                        FilesystemCompletionResultKind::File => false,
+                    },
+                }
+            }));
+        }
+        if complete_targets {
+            let target_entries =
+                self.get_target_entries(&root_package, document_uri, workspace_root)?;
+            names.extend(
+                target_entries
+                    .into_iter()
+                    // Filter out relative source files as they were already handled by filesystem completion
+                    .filter(|entry| {
+                        !((source_file_like || before_cursor.starts_with(':'))
+                            && entry.kind == TargetKind::SourceFile)
+                    })
+                    .map(|entry| {
+                        let drop_colon_or_slash = before_cursor[root_package.len()..]
+                            .starts_with(':')
+                            || before_cursor[root_package.len()..].starts_with('/');
+                        let text_edit = StringCompletionTextEdit {
+                            begin: root_package.chars().count()
+                                + if drop_colon_or_slash { 1 } else { 0 },
+                            end: current_value.chars().count(),
+                            text: format!(":{}", entry.value),
+                        };
+                        let additional_text_edits = if drop_colon_or_slash {
+                            Some(vec![StringCompletionTextEdit {
+                                begin: root_package.chars().count(),
+                                end: root_package.chars().count() + 1,
+                                text: String::from(""),
+                            }])
+                        } else {
+                            None
+                        };
+                        StringCompletionResult {
+                            label: entry.value,
+                            text_edit,
+                            additional_text_edits,
+                            kind: match entry.kind {
+                                TargetKind::SourceFile => CompletionItemKind::FILE,
+                                TargetKind::GeneratedFile => CompletionItemKind::REFERENCE,
+                                TargetKind::Rule(_) => CompletionItemKind::FIELD,
+                                TargetKind::Unknown(_) => CompletionItemKind::PROPERTY,
+                            },
+                            detail: Some(entry.kind.to_string()),
+                            trigger_another_completion: false,
+                        }
+                    }),
+            );
         }
 
         Ok(names)
