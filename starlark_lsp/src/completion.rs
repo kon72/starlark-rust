@@ -84,6 +84,8 @@ pub struct StringCompletionResult {
     pub detail: Option<String>,
     /// Whether this completion triggers another completion after it is inserted.
     pub trigger_another_completion: bool,
+    /// A string that should be used when comparing this item with other items.
+    pub sort_text: Option<String>,
 }
 
 impl StringCompletionTextEdit {
@@ -390,6 +392,7 @@ impl<T: LspContext> Backend<T> {
             .map(|result| CompletionItem {
                 label: result.label,
                 kind: Some(result.kind),
+                sort_text: result.sort_text,
                 label_details: Some(CompletionItemLabelDetails {
                     description: result.detail,
                     ..Default::default()

@@ -918,6 +918,7 @@ impl LspContext for BazelContext {
                         kind: CompletionItemKind::MODULE,
                         detail: None,
                         trigger_another_completion: true,
+                        sort_text: None,
                     }
                 })
                 .collect()
@@ -1039,6 +1040,10 @@ impl LspContext for BazelContext {
                 } else {
                     None
                 };
+                let sort_text = match &entry.kind {
+                    FilesystemCompletionResultKind::Directory => Some(format!("0{}", entry.value)),
+                    FilesystemCompletionResultKind::File => Some(format!("2{}", entry.value)),
+                };
                 StringCompletionResult {
                     label: entry.value,
                     text_edit,
@@ -1052,6 +1057,7 @@ impl LspContext for BazelContext {
                         FilesystemCompletionResultKind::Directory => true,
                         FilesystemCompletionResultKind::File => false,
                     },
+                    sort_text,
                 }
             }));
         }
@@ -1085,11 +1091,17 @@ impl LspContext for BazelContext {
                         } else {
                             None
                         };
+                        let sort_text = match &entry.kind {
+                            TargetKind::SourceFile => Some(format!("2{}", entry.value)),
+                            TargetKind::GeneratedFile => Some(format!("4{}", entry.value)),
+                            TargetKind::Rule(_) => Some(format!("1{}", entry.value)),
+                            TargetKind::Unknown(_) => Some(format!("3{}", entry.value)),
+                        };
                         StringCompletionResult {
                             label: entry.value,
                             text_edit,
                             additional_text_edits,
-                            kind: match entry.kind {
+                            kind: match &entry.kind {
                                 TargetKind::SourceFile => CompletionItemKind::FILE,
                                 TargetKind::GeneratedFile => CompletionItemKind::REFERENCE,
                                 TargetKind::Rule(_) => CompletionItemKind::FIELD,
@@ -1097,6 +1109,7 @@ impl LspContext for BazelContext {
                             },
                             detail: Some(entry.kind.to_string()),
                             trigger_another_completion: false,
+                            sort_text,
                         }
                     }),
             );
