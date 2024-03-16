@@ -669,7 +669,22 @@ impl BazelContext {
         } else {
             workspace_root
         };
-        if let Some(targets) = self.query_buildable_targets(from, query_dir) {
+
+        let current_file_dir = current_file.path().parent().unwrap();
+        let visible_from = (|| {
+            if Self::BUILD_FILE_NAMES
+                .contains(&current_file.path().file_name()?.to_string_lossy().as_ref())
+            {
+                if let Ok(relative_path) = current_file_dir.strip_prefix(workspace_root?) {
+                    return Some(format!("//{}:*", relative_path.to_string_lossy()));
+                }
+            }
+            None
+        })();
+
+        if let Some(targets) =
+            self.query_buildable_targets(from, query_dir, visible_from.as_deref())
+        {
             Ok(targets
                 .into_iter()
                 .map(|(kind, value)| TargetCompletionResult { value, kind })
@@ -683,12 +698,15 @@ impl BazelContext {
         &self,
         module: &str,
         workspace_dir: Option<&Path>,
+        visible_from: Option<&str>,
     ) -> Option<Vec<(TargetKind, String)>> {
         let mut raw_command = Command::new("bazel");
-        let mut command = raw_command
-            .arg("query")
-            .arg("--output=label_kind")
-            .arg(format!("{module}:*"));
+        let mut command = raw_command.arg("query").arg("--output=label_kind");
+        if let Some(visible_from) = visible_from {
+            command = command.arg(format!("visible({visible_from}, {module}:*)"));
+        } else {
+            command = command.arg(format!("{module}:*"));
+        }
         if let Some(workspace_dir) = workspace_dir {
             command = command.current_dir(workspace_dir);
         }
